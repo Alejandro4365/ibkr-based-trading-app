@@ -36,17 +36,17 @@ from datetime import datetime
 from typing import Any, Callable
 
 import pandas as pd
-from PyQt5.QtWidgets import (
+from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QTableWidget, QTableWidgetItem, QLabel, QPushButton,
     QLineEdit, QComboBox, QDoubleSpinBox, QSpinBox, QHeaderView,
-    QSizePolicy, QGroupBox, QSplitter, QFrame, QTextEdit,
+    QSizePolicy, QGroupBox, QSplitter, QFrame, QTextEdit
 )
-from PyQt5.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, pyqtSignal
-from PyQt5.QtGui import QColor, QCloseEvent, QFont
+from PyQt6.QtCore import Qt, QTimer, QRunnable, QThreadPool, QObject, pyqtSignal
+from PyQt6.QtGui import QColor, QCloseEvent, QFont
 
 import matplotlib
-matplotlib.use("Qt5Agg")
+matplotlib.use("QtAgg") # QtAgg works for both 5 and 6
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
