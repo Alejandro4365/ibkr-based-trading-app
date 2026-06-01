@@ -43,47 +43,18 @@ def get_connection(path: Path = _DB_PATH) -> sqlite3.Connection:
 #  SCHEMA
 # ════════════════════════════════════════════════════════════
 
-DDL = """
--- ── account_book ────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS account_book (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    recorded_at          TEXT    NOT NULL DEFAULT (datetime('now')),
-    net_liquidation      REAL,
-    total_cash           REAL,
-    available_funds      REAL,
-    buying_power         REAL,
-    gross_position       REAL,
-    unrealized_pnl       REAL,
-    realized_pnl         REAL,
-    init_margin_req      REAL,
-    maint_margin_req     REAL,
-    excess_liquidity     REAL,
-    cushion              REAL,
-    leverage             REAL,
-    day_trades_remaining REAL
-);
-CREATE INDEX IF NOT EXISTS idx_ab_ts ON account_book(recorded_at);
+SQL_DIR = Path(__file__).parent / "sql"
 
--- ── order_book ───────────────────────────────────────────────
---  Each row is one fill (execution).
---  exec_id is unique — INSERT OR IGNORE prevents duplicates
---  when the same fill arrives more than once (e.g. on reconnect).
-CREATE TABLE IF NOT EXISTS order_book (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id    INTEGER,
-    exec_id     TEXT    UNIQUE NOT NULL,
-    symbol      TEXT    NOT NULL,
-    recorded_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    side        TEXT,           -- BUY / SELL
-    qty         REAL,
-    price       REAL,
-    commission  REAL,
-    currency    TEXT,
-    order_type  TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_ob_symbol ON order_book(symbol);
-CREATE INDEX IF NOT EXISTS idx_ob_ts     ON order_book(recorded_at);
-"""
+def load_sql(*files: str) -> str:
+    return "\n".join(
+        (SQL_DIR / f).read_text(encoding="utf-8")
+        for f in files
+    )
+
+DDL = load_sql(
+    "schema.sql",
+    "indexes.sql",
+)
 
 
 def init_db(path: Path = _DB_PATH) -> sqlite3.Connection:
