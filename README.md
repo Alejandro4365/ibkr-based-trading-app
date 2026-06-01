@@ -6,6 +6,9 @@
 
 3. The connection is automatically closed along with IB Gateway by closing the GUI.
 
+Installing IBC: https://github.com/IbcAlpha/IBC
+Installing IB Gateway: https://www.interactivebrokers.com/campus/ibkr-quant-news/interactive-brokers-gateway-install-setup/
+
 
 
 
