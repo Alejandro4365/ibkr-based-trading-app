@@ -17,7 +17,7 @@ from datetime import datetime
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from ib_insync import (
-    IB, Contract, ScannerSubscription,
+    IB, Contract, TagValue, ScannerSubscription, ExecutionFilter,
     MarketOrder, LimitOrder, Order as IBOrder, util,
 )
 
@@ -241,6 +241,7 @@ class IBKRWorker(QThread):
     sig_fundamentals = pyqtSignal(dict)
     sig_order_placed = pyqtSignal(dict)
     sig_executions   = pyqtSignal(list)   # list[dict] — one dict per fill
+    sig_commission   = pyqtSignal(dict)   # {exec_id, commission, currency} — late-arriving report
 
     def __init__(self, cfg: ConnectionConfig) -> None:
         super().__init__()
@@ -249,6 +250,7 @@ class IBKRWorker(QThread):
         self.loop: asyncio.AbstractEventLoop | None = None
         self._pre_queue: list[tuple[str, dict]] = []
         self._lock = threading.Lock()
+        self._order_types: dict[int, str] = {} 
 
     def request(self, task: str, **kwargs) -> None:
         if self.loop and self.loop.is_running():
@@ -283,7 +285,8 @@ class IBKRWorker(QThread):
                 )
                 self.sig_status.emit("Connected.")
                 self.sig_connected.emit(True)
-                ib.execDetailsEvent += self._on_exec_detail   # live fill feed
+                ib.execDetailsEvent      += self._on_exec_detail   # live fill feed
+                ib.commissionReportEvent += self._on_commission     # late commission patch
                 return ib
             except Exception as exc:
                 self.sig_status.emit(f"Attempt {attempt} failed: {exc}")
@@ -296,25 +299,44 @@ class IBKRWorker(QThread):
     # ── Execution helpers ─────────────────────────────────────
 
     def _on_exec_detail(self, trade, fill) -> None:
-        """Called by ib_insync on every confirmed fill — fires sig_executions."""
-        self.sig_executions.emit([self._fill_to_record(fill, trade)])
+        """Live fill arrived — schedule a task to wait for commission."""
+        asyncio.run_coroutine_threadsafe(
+            self._wait_for_commission(trade, fill),
+            self.loop,
+        )
+
+    async def _wait_for_commission(self, trade, fill) -> None:
+        """Wait up to 30s for commission report, then store whatever we have."""
+        deadline = self.loop.time() + 30
+        while self.loop.time() < deadline:
+            if fill.commissionReport:
+                break
+            if not self._ib or not self._ib.isConnected():
+                break
+            await asyncio.sleep(0.5)
+        record = self._fill_to_record(fill, trade)
+        self.sig_executions.emit([record])
+
+    def _on_commission(self, trade, fill, report) -> None:
+        pass  # _wait_for_commission polls fill.commissionReport directly
 
     def _fill_to_record(self, fill, trade=None) -> dict:
-        """Convert an ib_insync Fill (+ optional Trade) to an execution_log dict."""
         ex   = fill.execution
         comm = 0.0
         curr = ""
+
         if fill.commissionReport:
             comm = fill.commissionReport.commission or 0.0
             curr = fill.commissionReport.currency   or ""
-        # Prefer trade.order fields (BUY/SELL, orderType); fall back to Execution
+
         if trade is not None and hasattr(trade, "order") and trade.order:
             side       = trade.order.action
             order_type = trade.order.orderType
         else:
             raw_side   = (ex.side or "").upper()
-            side       = "BUY"  if raw_side in ("BOT", "BUY")  else "SELL"
-            order_type = ""
+            side       = "BUY" if raw_side in ("BOT", "BUY") else "SELL"
+            order_type = self._order_types.get(ex.orderId, "")  # ← lookup here
+
         return {
             "order_id":   ex.orderId,
             "exec_id":    ex.execId,
@@ -331,7 +353,7 @@ class IBKRWorker(QThread):
     async def _fetch_executions(self, ib: IB) -> None:
         """Emit any fills already in the current session (e.g. on reconnect)."""
         self.sig_status.emit("Fetching session executions…")
-        fills = ib.fills()   # current-session fills cached by ib_insync
+        fills = ib.fills()
         if fills:
             records = [self._fill_to_record(f) for f in fills]
             self.sig_executions.emit(records)
@@ -339,20 +361,38 @@ class IBKRWorker(QThread):
         else:
             self.sig_status.emit("Executions: none this session")
 
+    async def _fetch_executions_historical(self, ib: IB) -> None:
+        self.sig_status.emit("Fetching historical executions…")
+        fills = await self._t(
+            ib.reqExecutionsAsync(ExecutionFilter()),
+            "HistoricalExecutions", timeout=30,
+        ) or []
+        if fills:
+            trades_by_oid = {t.order.orderId: t for t in ib.trades()}
+            records = [
+                self._fill_to_record(f, trades_by_oid.get(f.execution.orderId))
+                for f in fills
+            ]
+            self.sig_executions.emit(records)
+            self.sig_status.emit(f"Historical executions: {len(records)} fills loaded")
+        else:
+            self.sig_status.emit("Historical executions: none found")
+
     async def _dispatch(self, ib: IB, task: str, kw: dict) -> None:
         match task:
-            case "portfolio":    await self._fetch_portfolio(ib)
-            case "account":      await self._fetch_account(ib)
-            case "orders":       await self._fetch_orders(ib)
-            case "executions":   await self._fetch_executions(ib)
-            case "contract":     await self._fetch_contract(ib, kw)
-            case "hist_data":    await self._fetch_hist(ib, kw)
-            case "snapshot":     await self._fetch_snapshot(ib, kw)
-            case "scanner":      await self._fetch_scanner(ib, kw)
-            case "fundamentals": await self._fetch_fundamentals(ib, kw)
-            case "place_order":  await self._place_order(ib, kw)
-            case "cancel_order": self._cancel_order(ib, kw)
-            case _:              self.sig_status.emit(f"Unknown task: {task!r}")
+            case "portfolio":               await self._fetch_portfolio(ib)
+            case "account":                 await self._fetch_account(ib)
+            case "orders":                  await self._fetch_orders(ib)
+            case "executions":              await self._fetch_executions(ib)
+            case "executions_historical":   await self._fetch_executions_historical(ib)
+            case "contract":                await self._fetch_contract(ib, kw)
+            case "hist_data":               await self._fetch_hist(ib, kw)
+            case "snapshot":                await self._fetch_snapshot(ib, kw)
+            case "scanner":                 await self._fetch_scanner(ib, kw)
+            case "fundamentals":            await self._fetch_fundamentals(ib, kw)
+            case "place_order":             await self._place_order(ib, kw)
+            case "cancel_order":            self._cancel_order(ib, kw)
+            case _:                         self.sig_status.emit(f"Unknown task: {task!r}")
 
     async def _fetch_portfolio(self, ib: IB) -> None:
         self.sig_status.emit("Fetching portfolio…")
@@ -542,7 +582,7 @@ class IBKRWorker(QThread):
 
         self.sig_status.emit(f"Placing {order_type} {action} {quantity} {contract.symbol}…")
         trade = ib.placeOrder(contract, order)
-
+        self._order_types[trade.order.orderId] = order_type
         deadline = asyncio.get_event_loop().time() + 10
         while asyncio.get_event_loop().time() < deadline:
             await asyncio.sleep(0.5) # FIX: Avoid ib.sleep crash
@@ -587,7 +627,7 @@ class IBKRWorker(QThread):
         if not ib:
             return
 
-        for task in ("portfolio", "account", "orders", "executions"):
+        for task in ("portfolio", "account", "orders", "executions", "executions_historical"):
             self._queue.put_nowait((task, {}))
 
         # FIX: robustly handle event loop queue with wait_for, instead of sleep

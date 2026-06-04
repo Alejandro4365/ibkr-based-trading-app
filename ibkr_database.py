@@ -43,18 +43,47 @@ def get_connection(path: Path = _DB_PATH) -> sqlite3.Connection:
 #  SCHEMA
 # ════════════════════════════════════════════════════════════
 
-SQL_DIR = Path(__file__).parent / "sql"
+DDL = """
+-- ── account_book ────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS account_book (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    recorded_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+    net_liquidation      REAL,
+    total_cash           REAL,
+    available_funds      REAL,
+    buying_power         REAL,
+    gross_position       REAL,
+    unrealized_pnl       REAL,
+    realized_pnl         REAL,
+    init_margin_req      REAL,
+    maint_margin_req     REAL,
+    excess_liquidity     REAL,
+    cushion              REAL,
+    leverage             REAL,
+    day_trades_remaining REAL
+);
+CREATE INDEX IF NOT EXISTS idx_ab_ts ON account_book(recorded_at);
 
-def load_sql(*files: str) -> str:
-    return "\n".join(
-        (SQL_DIR / f).read_text(encoding="utf-8")
-        for f in files
-    )
-
-DDL = load_sql(
-    "schema.sql",
-    "indexes.sql",
-)
+-- ── order_book ───────────────────────────────────────────────
+--  Each row is one fill (execution).
+--  exec_id is unique — INSERT OR IGNORE prevents duplicates
+--  when the same fill arrives more than once (e.g. on reconnect).
+CREATE TABLE IF NOT EXISTS order_book (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id    INTEGER,
+    exec_id     TEXT    UNIQUE NOT NULL,
+    symbol      TEXT    NOT NULL,
+    recorded_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    side        TEXT,           -- BUY / SELL
+    qty         REAL,
+    price       REAL,
+    commission  REAL,
+    currency    TEXT,
+    order_type  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ob_symbol ON order_book(symbol);
+CREATE INDEX IF NOT EXISTS idx_ob_ts     ON order_book(recorded_at);
+"""
 
 
 def init_db(path: Path = _DB_PATH) -> sqlite3.Connection:
@@ -199,6 +228,29 @@ class DatabaseManager:
         self.conn.commit()
         return len(rows)
 
+    def update_commission(self, exec_id: str, commission: float,
+                          currency: str) -> None:
+        """
+        Patch commission and currency on an already-stored row.
+        Called when ib_insync fires commissionReportEvent after the fill
+        has already been written — only updates if the row exists and the
+        new value is non-zero so a stale 0.0 never overwrites real data.
+        """
+        if not exec_id:
+            return
+        safe = self._safe_float(commission)
+        if safe is None or safe == 0.0:
+            return
+        self._exec(
+            """
+            UPDATE order_book
+               SET commission = ?,
+                   currency   = ?
+             WHERE exec_id = ?
+            """,
+            (safe, currency or "", exec_id),
+        )
+
     def get_execution_log(self, limit: int = 500) -> list[sqlite3.Row]:
         """Return execution log rows, newest-first."""
         cur = self.conn.execute(
@@ -250,41 +302,3 @@ def get_db(path: Path = _DB_PATH) -> DatabaseManager:
 
 if __name__ == "__main__":
     db = DatabaseManager(_DB_PATH)
-
-    print("should_store_account (fresh DB):", db.should_store_account())   # True
-
-    db.insert_account_book({
-        "NetLiquidation": 100_000.0, "TotalCashValue": 50_000.0,
-        "AvailableFunds": 45_000.0,  "BuyingPower":    90_000.0,
-        "GrossPositionValue": 55_000.0,
-        "UnrealizedPnL": 1_234.56,   "RealizedPnL":   -200.0,
-        "InitMarginReq": 10_000.0,   "MaintMarginReq": 8_000.0,
-        "ExcessLiquidity": 37_000.0, "Cushion":         0.37,
-        "Leverage": 1.1,             "DayTradesRemaining": 3.0,
-    })
-    print("should_store_account (just stored):", db.should_store_account())  # False
-    print("latest account:", dict(db.get_latest_account()))
-
-    n = db.insert_executions([
-        {"order_id": 1, "exec_id": "EXEC001", "symbol": "AAPL",
-         "timestamp": "2025-01-15 10:30:00", "side": "BUY",
-         "qty": 100, "price": 185.50, "commission": 1.0,
-         "currency": "USD", "order_type": "LMT"},
-        {"order_id": 1, "exec_id": "EXEC001",   # duplicate — ignored
-         "symbol": "AAPL", "timestamp": "2025-01-15 10:30:00",
-         "side": "BUY", "qty": 100, "price": 185.50,
-         "commission": 1.0, "currency": "USD", "order_type": "LMT"},
-        {"order_id": 2, "exec_id": "EXEC002", "symbol": "MSFT",
-         "timestamp": "2025-01-15 11:00:00", "side": "SELL",
-         "qty": 50, "price": 420.0, "commission": 0.75,
-         "currency": "USD", "order_type": "MKT"},
-    ])
-    print(f"insert_executions attempted {n} rows")
-    execs = db.get_execution_log()
-    print(f"execution log rows: {len(execs)}")   # 2 (EXEC001 deduped)
-    for r in execs:
-        print(" ", dict(r))
-
-    print("stats:", db.get_db_stats())
-    db.close()
-    print("\n[OK] Self-test passed.")
