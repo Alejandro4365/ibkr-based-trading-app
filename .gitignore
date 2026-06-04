@@ -1,0 +1,17 @@
+# Virtual environments
+.venv/
+
+# Python
+__pycache__/
+
+# IDE
+.vscode/
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# Env files (important for your IBKR bot)
+.env
+*.env
